@@ -1,4 +1,4 @@
-"""FastAPI application for finding parcels with insufficient cloud-free coverage."""
+"""FastAPI application for parcel coverage analysis and NDVI mosaicking."""
 
 from __future__ import annotations
 
@@ -8,8 +8,11 @@ import tempfile
 from pathlib import Path
 from typing import Annotated
 
+import rasterio
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from app.analysis import (
     IncompatibleFile,
@@ -17,13 +20,20 @@ from app.analysis import (
     analyze_coverage,
     validate_uploads,
 )
+from app.mosaic import (
+    MAX_FEATHER,
+    MIN_FEATHER,
+    mosaic_scenes,
+    validate_mosaic_uploads,
+)
 
 app = FastAPI(
-    title="农情遥感补采分析 API",
+    title="农情遥感分析 API",
     version="1.0.0",
     description=(
-        "上传一张地块编号图和任一数量的单波段无云掩膜，统计每个地块的"
-        "总像元数与至少一景无云覆盖的像元数，并返回覆盖率低于目标值的地块。"
+        "提供两类服务：上传地块编号图和各景无云掩膜，统计地块无云覆盖率；"
+        "或上传多景单波段 Float32 NDVI 景和羽化宽度，按到最近无效像元的"
+        "欧氏距离加权拼接，输出分块写入的 Float32 GeoTIFF。"
     ),
 )
 
@@ -78,7 +88,7 @@ def health() -> dict[str, str]:
 @app.get("/", include_in_schema=False)
 def root() -> dict[str, str]:
     return {
-        "name": "农情遥感补采分析 API",
+        "name": "农情遥感分析 API",
         "docs": "/docs",
         "openapi": "/openapi.json",
     }
@@ -179,3 +189,155 @@ def analyze(
             for r in below
         ],
     )
+
+
+def _parse_feather_width(raw: str) -> int:
+    try:
+        feather = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"feather_width 必须是 {MIN_FEATHER} 到 {MAX_FEATHER} 之间的整数。"
+            ),
+        )
+    if not (MIN_FEATHER <= feather <= MAX_FEATHER):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"feather_width 必须在 {MIN_FEATHER} 到 {MAX_FEATHER} 像元之间，"
+                f"收到 {feather}。"
+            ),
+        )
+    return feather
+
+
+@app.post(
+    "/mosaic",
+    tags=["拼接"],
+    summary="多景 Float32 NDVI 羽化加权拼接，下载 GeoTIFF",
+    response_class=FileResponse,
+    responses={
+        200: {
+            "description": "拼接完成后的单波段 Float32 GeoTIFF，NoData 为 NaN",
+            "content": {"image/tiff": {}},
+        },
+        400: {
+            "description": (
+                "参数非法或存在不兼容/不可读的 GeoTIFF，响应中列出具体文件与原因"
+            ),
+        },
+    },
+)
+def mosaic(
+    parcel: Annotated[
+        UploadFile,
+        File(
+            description=(
+                "地块编号图：单波段 GeoTIFF，北向上；只决定输出范围、"
+                "尺寸和像元格网，不参与数值计算"
+            )
+        ),
+    ],
+    scenes: Annotated[
+        list[UploadFile],
+        File(
+            description=(
+                "各景单波段 Float32 NDVI GeoTIFF，北向上，坐标系和分辨率与"
+                "地块图相同，原点可按整数像元错开；可一次上传多景"
+            )
+        ),
+    ],
+    feather_width: Annotated[
+        str,
+        Form(
+            description=(
+                f"羽化宽度（像元），{MIN_FEATHER}～{MAX_FEATHER} 的整数；"
+                "每景权重为到最近无效像元的欧氏距离并按该值截断"
+            ),
+        ),
+    ],
+) -> FileResponse:
+    feather = _parse_feather_width(feather_width)
+    if not scenes:
+        raise HTTPException(status_code=400, detail="至少上传一景 NDVI 影像。")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="agri-mosaic-"))
+    parcels_dir = tmp_dir / "parcels"
+    scenes_dir = tmp_dir / "scenes"
+    parcels_dir.mkdir()
+    scenes_dir.mkdir()
+
+    def _cleanup() -> None:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    try:
+        parcel_name = _safe_upload_name(parcel, 0)
+        parcel_dest = parcels_dir / "parcel_0000.tif"
+        _save_upload(parcel, parcel_dest)
+        parcel_upload = UploadedRaster(
+            path=str(parcel_dest), filename=parcel_name, role="parcel"
+        )
+
+        scene_uploads: list[UploadedRaster] = []
+        for index, scene in enumerate(scenes, start=1):
+            scene_name = _safe_upload_name(scene, index)
+            scene_dest = scenes_dir / f"scene_{index:04d}.tif"
+            _save_upload(scene, scene_dest)
+            scene_uploads.append(
+                UploadedRaster(
+                    path=str(scene_dest), filename=scene_name, role="scene"
+                )
+            )
+
+        parcel_meta, scene_metas, errors = validate_mosaic_uploads(
+            parcel_upload, scene_uploads
+        )
+        if errors:
+            raise _incompatible_response(errors)
+        assert parcel_meta is not None
+        assert len(scene_metas) == len(scene_uploads)
+
+        output_path = tmp_dir / "ndvi_mosaic.tif"
+        try:
+            mosaic_scenes(parcel_meta, scene_metas, str(output_path), feather)
+        except (rasterio.RasterioIOError, OSError) as exc:
+            # Map the private temp path back to the user-provided file name so
+            # the message points at the upload that could not be read.
+            message = str(exc)
+            responsible = "未知文件"
+            for upload in [parcel_upload, *scene_uploads]:
+                if upload.path in message:
+                    responsible = upload.filename
+                    message = message.replace(upload.path, upload.filename)
+                    break
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "读取 GeoTIFF 失败，未生成拼接结果。",
+                    "incompatible_files": [
+                        {
+                            "filename": responsible,
+                            "role": (
+                                "parcel"
+                                if responsible == parcel_name
+                                else "scene"
+                            ),
+                            "reason": f"无法读取栅格数据：{message}",
+                        }
+                    ],
+                },
+            )
+
+        # The file is fully written and closed before FileResponse starts
+        # streaming, so a failed request never exposes a partial download.
+        # Cleanup runs exactly once, after the response has been sent.
+        return FileResponse(
+            output_path,
+            media_type="image/tiff",
+            filename="ndvi_mosaic.tif",
+            background=BackgroundTask(_cleanup),
+        )
+    except BaseException:
+        _cleanup()
+        raise
